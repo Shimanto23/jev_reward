@@ -87,7 +87,7 @@ python "$PROJECT_DIR/train_CoRe.py" \
   num_seed_steps=250 \
   num_pre_steps=250 \
   num_interact=1000 \
-  max_feedback=150 \
+  max_feedback=300 \
   RRM_batch=10 \
   RRM_update=25 \
   eval_frequency=250 \
