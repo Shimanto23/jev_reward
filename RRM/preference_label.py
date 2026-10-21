@@ -250,17 +250,21 @@ class PreAgent(Agent):
             )
             return canvas
 
+        legend = np.full_like(
+            tile(np.asarray(self.init_image), "CLIPS BELOW"),
+            255,
+        )
         frames = [
             tile(np.asarray(self.init_image), "INITIAL REFERENCE"),
             tile(np.asarray(self.goal_image), "GOAL REFERENCE"),
+            legend,
         ]
         frames.extend(tile(frame, f"A{idx + 1}") for idx, frame in enumerate(frames_a))
         frames.extend(tile(frame, f"B{idx + 1}") for idx, frame in enumerate(frames_b))
 
-        # Four columns by two rows: references, then the three frames from A and B.
-        while len(frames) < 8:
-            frames.append(np.full_like(frames[0], 255))
-        rows = [cv2.hconcat(frames[i:i + 4]) for i in (0, 4)]
+        # Keep each clip on its own row so the temporal sequences are easy to compare.
+        # The first row contains the two references and a small legend tile.
+        rows = [cv2.hconcat(frames[i:i + 3]) for i in (0, 3, 6)]
         sheet = cv2.vconcat(rows)
         ok, encoded = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if not ok:
@@ -268,12 +272,21 @@ class PreAgent(Agent):
         return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
 
     def _query_openjev(self, image_data_url):
+        task_specific_guidance = ""
+        if "ClothFoldDiagonal" in self.env_name:
+            task_specific_guidance = (
+                " For this task, compare the cloth's overall shape and "
+                "alignment with the goal reference for a fold from the top-left "
+                "corner toward the bottom-right corner. Lifting or bunching "
+                "the cloth without matching that target is not progress."
+            )
+
         state = {
             "text": (
                 f"Task: {self.task_description}. The attached comparison sheet "
                 "contains initial and goal references, followed by sampled frames "
                 "A1-A3 and B1-B3. Judge progress toward the goal, not visual "
-                "difference from the initial state."
+                "difference from the initial state." + task_specific_guidance
             ),
             "image": image_data_url,
         }
@@ -418,16 +431,17 @@ class PreAgent(Agent):
                         encoding="utf-8",
                     ) as f:
                         json.dump(response, f, indent=2)
+                    # Frame scores are useful PRM supervision even when the
+                    # pairwise choice is too uncertain to train the RRM.
+                    weight_a = self.interpolate_to_weight_dist(weight_a, sample_indices)
+                    weight_b = self.interpolate_to_weight_dist(weight_b, sample_indices)
                     if label != -1:
-                        weight_a = self.interpolate_to_weight_dist(weight_a, sample_indices)
-                        weight_b = self.interpolate_to_weight_dist(weight_b, sample_indices)
                         print(
                             f"OpenJEV preference label: {label} "
                             f"(confidence {confidence:.3f}; "
                             f"skip threshold {openjev_skip_margin:.3f})"
                         )
                     else:
-                        weight_a = weight_b = None
                         print(
                             f"OpenJEV skipped an uncertain preference "
                             f"(confidence {confidence:.3f}; "

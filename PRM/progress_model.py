@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class ProgressRewardModel(nn.Module):
-    """Learn image -> task progress in [0, 1] from CoRe VLM scores."""
+    """Learn image -> task progress in [0, 1] from OpenJEV frame scores."""
 
     def __init__(self, device, lr=1e-4, batch_size=32):
         super().__init__()
@@ -69,22 +69,24 @@ class ProgressRewardModel(nn.Module):
                 "PRM requires segment > 1 to use CoRe frame-progress scores."
             )
 
-        size = rrm.capacity if rrm.buffer_full else rrm.buffer_index
-        if size <= 0:
-            return 0.0
-
-        x = np.concatenate([
-            rrm.buffer_seg1[:size],
-            rrm.buffer_seg2[:size]
-        ], axis=0)
-
-        y = np.concatenate([
-            rrm.buffer_score_1[:size],
-            rrm.buffer_score_2[:size]
-        ], axis=0)
-
-        x = x.reshape(-1, x.shape[2], x.shape[3], 3)
-        y = y.reshape(-1).astype(np.float32)
+        if getattr(rrm, "progress_size", 0) > 0:
+            x = np.asarray(rrm.progress_images, dtype=np.uint8)
+            y = np.asarray(rrm.progress_targets, dtype=np.float32)
+        else:
+            # Backward compatibility for older checkpoints and cached datasets.
+            size = rrm.capacity if rrm.buffer_full else rrm.buffer_index
+            if size <= 0:
+                return 0.0
+            x = np.concatenate([
+                rrm.buffer_seg1[:size],
+                rrm.buffer_seg2[:size]
+            ], axis=0)
+            y = np.concatenate([
+                rrm.buffer_score_1[:size],
+                rrm.buffer_score_2[:size]
+            ], axis=0)
+            x = x.reshape(-1, x.shape[2], x.shape[3], 3)
+            y = y.reshape(-1).astype(np.float32)
 
         valid = np.isfinite(y)
         x = x[valid]

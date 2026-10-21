@@ -118,6 +118,14 @@ class RewardModel:
         self.buffer_index = 0
         self.buffer_full = False
 
+        # Keep per-frame progress supervision separately from accepted
+        # pairwise preferences. OpenJEV can abstain on a pair while still
+        # returning useful scores for each clip's frames.
+        self.progress_images = []
+        self.progress_targets = []
+        self.progress_size = 0
+        self.query_count = 0
+
         # reward model
         self.de = ensemble_size
         self.lr = lr
@@ -414,6 +422,10 @@ class RewardModel:
             if hasattr(self, name):
                 delattr(self, name)
 
+        self.progress_images = []
+        self.progress_targets = []
+        self.progress_size = 0
+
         gc.collect()
 
         self.preference_data_emptyed = True
@@ -481,6 +493,12 @@ class RewardModel:
             "buffer_index":
                 self.buffer_index,
 
+            "query_count":
+                self.query_count,
+
+            "progress_size":
+                self.progress_size,
+
             "buffer_full":
                 self.buffer_full,
 
@@ -545,9 +563,18 @@ class RewardModel:
         )
 
         if self.preference_data_emptyed:
+            if self.progress_size > 0:
+                np.save(
+                    os.path.join(save_dir, "progress_images.npy"),
+                    np.asarray(self.progress_images, dtype=np.uint8)
+                )
+                np.save(
+                    os.path.join(save_dir, "progress_targets.npy"),
+                    np.asarray(self.progress_targets, dtype=np.float32)
+                )
             print(
                 "[RRM CHECKPOINT] Preference data had already "
-                "been emptied; model/counters saved only."
+                "been emptied; saved model/counters and retained PRM scores."
             )
             return
 
@@ -610,6 +637,16 @@ class RewardModel:
                     "buffer_score_2.npy"
                 ),
                 self.buffer_score_2[:preference_size]
+            )
+
+        if self.progress_size > 0:
+            np.save(
+                os.path.join(save_dir, "progress_images.npy"),
+                np.asarray(self.progress_images, dtype=np.uint8)
+            )
+            np.save(
+                os.path.join(save_dir, "progress_targets.npy"),
+                np.asarray(self.progress_targets, dtype=np.float32)
             )
 
         # ============================================================
@@ -823,6 +860,9 @@ class RewardModel:
             state["buffer_index"]
         )
 
+        self.query_count = int(state.get("query_count", 0))
+        self.progress_size = int(state.get("progress_size", 0))
+
         self.buffer_full = bool(
             state["buffer_full"]
         )
@@ -860,11 +900,22 @@ class RewardModel:
         )
 
         if saved_empty:
+            saved_progress_size = int(state.get("progress_size", 0))
             self._clear_preference_storage_for_resume()
+            if saved_progress_size > 0:
+                self.progress_images = list(np.load(
+                    os.path.join(save_dir, "progress_images.npy"),
+                    mmap_mode="r"
+                ))
+                self.progress_targets = list(np.load(
+                    os.path.join(save_dir, "progress_targets.npy"),
+                    mmap_mode="r"
+                ).astype(np.float32))
+                self.progress_size = saved_progress_size
 
             print(
                 "[RRM CHECKPOINT] Loaded model/counters. "
-                "Preference data remains emptied."
+                "Pairwise preference data remains emptied; PRM scores restored."
             )
 
             return
@@ -951,6 +1002,16 @@ class RewardModel:
                 ),
                 mmap_mode="r"
             )
+
+        if self.progress_size > 0:
+            self.progress_images = list(np.load(
+                os.path.join(save_dir, "progress_images.npy"),
+                mmap_mode="r"
+            ))
+            self.progress_targets = list(np.load(
+                os.path.join(save_dir, "progress_targets.npy"),
+                mmap_mode="r"
+            ).astype(np.float32))
 
         # ============================================================
         # Restore RRM Trajectory State Data
@@ -1058,6 +1119,40 @@ class RewardModel:
             f"trajectory rows={trajectory_rows}"
             )
     
+    def _query_uncertainty(self, img_t_1, img_t_2):
+        """Estimate pairwise uncertainty from disagreement across RRM members."""
+        batch, segment, height, width, channels = img_t_1.shape
+        images = np.concatenate([img_t_1, img_t_2], axis=1)
+        images = np.transpose(images, (0, 1, 4, 2, 3)).reshape(
+            batch * 2 * segment, channels, height, width
+        ).astype(np.float32) / 255.0
+
+        member_differences = []
+        modes = [member.training for member in self.ensemble]
+        try:
+            for member in self.ensemble:
+                member.eval()
+            with torch.no_grad():
+                inputs = torch.from_numpy(images).to(device)
+                for member in self.ensemble:
+                    predictions = member(inputs).view(batch, 2, segment)
+                    member_differences.append(
+                        (predictions[:, 1] - predictions[:, 0]).sum(dim=1).cpu().numpy()
+                    )
+        finally:
+            for member, was_training in zip(self.ensemble, modes):
+                member.train(was_training)
+
+        differences = np.asarray(member_differences, dtype=np.float32)
+        if differences.shape[0] <= 1:
+            return np.zeros(batch, dtype=np.float32)
+
+        # Combine disagreement in predicted return difference with vote
+        # disagreement. The latter remains useful while the reward scale is small.
+        signs = differences >= 0
+        vote_uncertainty = 1.0 - np.maximum(signs.mean(axis=0), 1.0 - signs.mean(axis=0))
+        return differences.std(axis=0) + vote_uncertainty
+
     def get_queries(self, mb_size=20):
         max_len = self.max_size if self.buffer_pre_full else self.buffer_pre_idx
         # get train traj
@@ -1066,17 +1161,26 @@ class RewardModel:
         train_images = np.asarray(self.img_inputs[:max_len])
 
         
-        # choose random episode
-        batch_index_2 = np.random.choice(max_len, size=mb_size, replace=True)
-        batch_index_1 = np.random.choice(max_len, size=mb_size, replace=True)
+        active = (
+            os.environ.get("RRM_ACTIVE_QUERY", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        warmup = int(os.environ.get("RRM_ACTIVE_WARMUP", "30"))
+        candidate_factor = max(2, int(os.environ.get("RRM_ACTIVE_CANDIDATE_FACTOR", "4")))
+        candidate_count = mb_size * candidate_factor if active and self.query_count >= warmup else mb_size
+
+        # Random warm-up ensures the reward ensemble has labels before it
+        # influences which comparisons are sent to OpenJEV.
+        batch_index_2 = np.random.choice(max_len, size=candidate_count, replace=True)
+        batch_index_1 = np.random.choice(max_len, size=candidate_count, replace=True)
 
         # Generate time index
         sigment_time = np.arange(self.size_segment).reshape(1, -1)
 
         if 'Cloth' not in self.env_name:
-            random_idx_2 = np.random.choice(self.episode_length-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
+            random_idx_2 = np.random.choice(self.episode_length-self.size_segment, size=candidate_count, replace=True).reshape(-1,1)
             time_index_2 = sigment_time + random_idx_2
-            random_idx_1 = np.random.choice(self.episode_length-self.size_segment, size=mb_size, replace=True).reshape(-1,1)
+            random_idx_1 = np.random.choice(self.episode_length-self.size_segment, size=candidate_count, replace=True).reshape(-1,1)
             time_index_1 = sigment_time + random_idx_1
         else:
             time_index_2 = sigment_time
@@ -1089,8 +1193,58 @@ class RewardModel:
  
         img_t_1 = train_images[batch_index_1[:, None], time_index_1]
         img_t_2 = train_images[batch_index_2[:, None], time_index_2]  # bath x segment x image_height x image_width x3
+
+        if candidate_count > mb_size:
+            uncertainty = self._query_uncertainty(img_t_1, img_t_2)
+            random_count = max(1, int(round(mb_size * 0.2)))
+            active_count = mb_size - random_count
+            ranked = np.argsort(uncertainty)
+            selected = list(ranked[-active_count:]) if active_count else []
+            remaining = np.setdiff1d(np.arange(candidate_count), selected, assume_unique=False)
+            selected.extend(np.random.choice(remaining, size=random_count, replace=False).tolist())
+            selected = np.asarray(selected, dtype=np.int64)
+
+            batch_index_1 = batch_index_1[selected]
+            batch_index_2 = batch_index_2[selected]
+            sa_t_1 = sa_t_1[selected]
+            sa_t_2 = sa_t_2[selected]
+            r_t_1 = r_t_1[selected]
+            r_t_2 = r_t_2[selected]
+            img_t_1 = img_t_1[selected]
+            img_t_2 = img_t_2[selected]
+
+            print(
+                f"[RRM ACTIVE QUERY] selected {active_count} high-uncertainty "
+                f"and {random_count} random comparisons from {candidate_count} candidates"
+            )
+
+        self.query_count += mb_size
         
         return sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2
+
+    def _store_progress_scores(self, images_a, images_b, weights):
+        if self.size_segment <= 1 or weights is None:
+            return
+        if len(weights) != len(images_a):
+            return
+
+        for idx, row in enumerate(weights):
+            if row is None or len(row) != 2:
+                continue
+            for images, raw_scores in ((images_a[idx], row[0]), (images_b[idx], row[1])):
+                if raw_scores is None:
+                    continue
+                scores = np.asarray(raw_scores, dtype=np.float32).reshape(-1)
+                if len(scores) != self.size_segment:
+                    continue
+                valid = np.isfinite(scores)
+                if not np.any(valid):
+                    continue
+                self.progress_images.extend(
+                    frame.copy() for frame in images[valid]
+                )
+                self.progress_targets.extend(scores[valid].tolist())
+                self.progress_size += int(valid.sum())
 
     def put_queries(self, sa_t_1, sa_t_2, labels, frm_1, frm_2, vlm_weights): # frm_1 data for reward check
         total_sample = sa_t_1.shape[0]
@@ -1216,7 +1370,7 @@ class RewardModel:
         start_time = time.time()
         time_string = datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d-%H-%M-%S')
 
-        print(f"Using online vlm labels for this query!")
+        print(f"Using online preference model labels for this query!")
         vlm_labels = []
         vlm_weights = []
         for idx, (video1, video2) in enumerate(zip(img_t_1, img_t_2)):
@@ -1234,7 +1388,10 @@ class RewardModel:
                 vlm_labels.append(label)
                 vlm_weights.append([vlm_weights_0, vlm_weights_1])
         
-        # remove the vlm label=-1
+        # Preserve frame-level scores for PRM before filtering abstained pairs.
+        self._store_progress_scores(img_t_1, img_t_2, vlm_weights)
+
+        # remove pairwise label=-1 from the RRM preference dataset.
         sa_t_1, sa_t_2, r_t_1, r_t_2, rational_labels, vlm_labels, vlm_weights, img_t_1, img_t_2 = self.filter_useless_label(
             sa_t_1, sa_t_2, r_t_1, r_t_2, rational_labels, vlm_labels, vlm_weights, img_t_1, img_t_2
         )
