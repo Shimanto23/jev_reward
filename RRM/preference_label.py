@@ -20,7 +20,7 @@ from RRM.prompt import env_goal_prompts
 
 model_type = os.environ.get(
     "VLLM_MODEL",
-    "Qwen/Qwen3.5-9B"
+    "openjev/openjev-FP8"
 )
 api_key = os.environ.get("MY_API_KEY", "EMPTY")
 label_backend = os.environ.get("RRM_LABEL_BACKEND", "openjev").strip().lower()
