@@ -368,7 +368,8 @@ class PreAgent(Agent):
         # probability-gap fallback for helper versions that omit that field.
         confidence = float(preference_answer.get("confidence", probability_gap))
         confidence = float(np.clip(confidence, 0.0, 1.0))
-        label = -1 if confidence < openjev_skip_margin else int(choice == "B")
+        raw_label = int(choice == "B")
+        label = -1 if confidence < openjev_skip_margin else raw_label
 
         def get_scores(clip):
             values = []
@@ -377,7 +378,7 @@ class PreAgent(Agent):
                 values.append(float(np.clip(score, 0.0, 1.0)))
             return np.asarray(values, dtype=np.float32)
 
-        return label, get_scores("A"), get_scores("B"), confidence, response
+        return label, get_scores("A"), get_scores("B"), confidence, response, raw_label
 
     def extract_answer(self, response):
 
@@ -412,6 +413,8 @@ class PreAgent(Agent):
         label = -1
         weight_a = None
         weight_b = None
+        confidence = None
+        raw_label = None
         query_image_num = 3
         sample_indices = get_n_indices(img_t_1.shape[0], query_image_num)
         query_img_t_1 = img_t_1[sample_indices]
@@ -420,7 +423,7 @@ class PreAgent(Agent):
         if label_backend == "openjev":
             for attempt in range(max_retries):
                 try:
-                    label, weight_a, weight_b, confidence, response = self._openjev_label_and_progress(
+                    label, weight_a, weight_b, confidence, response, raw_label = self._openjev_label_and_progress(
                         query_img_t_1,
                         query_img_t_2,
                     )
@@ -447,7 +450,7 @@ class PreAgent(Agent):
                             f"(confidence {confidence:.3f}; "
                             f"skip threshold {openjev_skip_margin:.3f})"
                         )
-                    return label, weight_a, weight_b
+                    return label, weight_a, weight_b, confidence, raw_label
                 except Exception as e:
                     print(
                         f"OpenJEV preference query failed "
@@ -455,7 +458,7 @@ class PreAgent(Agent):
                     )
                     if attempt + 1 < max_retries:
                         time.sleep(min(2 ** attempt, 10))
-            return -1, None, None
+            return -1, None, None, None, None
 
         while not success and try_cnt < max_retries:
             if self.client == None:
@@ -499,8 +502,8 @@ class PreAgent(Agent):
             try:
                 weight_dist_a = self.interpolate_to_weight_dist(weight_a, sample_indices)
                 weight_dist_b = self.interpolate_to_weight_dist(weight_b, sample_indices)
-                return label, weight_dist_a, weight_dist_b
+                return label, weight_dist_a, weight_dist_b, None, label
             except:
-                return -1, None, None
+                return -1, None, None, None, None
         else:
-            return -1, None, None
+            return -1, None, None, None, None

@@ -14,6 +14,7 @@ from PIL import Image
 import datetime
 import pickle as pkl
 import random
+import json
 import cv2
 import warnings
 from RRM.preference_label import PreAgent
@@ -125,6 +126,8 @@ class RewardModel:
         self.progress_targets = []
         self.progress_size = 0
         self.query_count = 0
+        self.last_audit_mask = np.zeros(self.mb_size, dtype=bool)
+        self.openjev_audit_records = []
 
         # reward model
         self.de = ensemble_size
@@ -1168,6 +1171,7 @@ class RewardModel:
         warmup = int(os.environ.get("RRM_ACTIVE_WARMUP", "30"))
         candidate_factor = max(2, int(os.environ.get("RRM_ACTIVE_CANDIDATE_FACTOR", "4")))
         candidate_count = mb_size * candidate_factor if active and self.query_count >= warmup else mb_size
+        self.last_audit_mask = np.zeros(mb_size, dtype=bool)
 
         # Random warm-up ensures the reward ensemble has labels before it
         # influences which comparisons are sent to OpenJEV.
@@ -1201,8 +1205,20 @@ class RewardModel:
             ranked = np.argsort(uncertainty)
             selected = list(ranked[-active_count:]) if active_count else []
             remaining = np.setdiff1d(np.arange(candidate_count), selected, assume_unique=False)
-            selected.extend(np.random.choice(remaining, size=random_count, replace=False).tolist())
+            random_selected = np.random.choice(
+                remaining,
+                size=random_count,
+                replace=False
+            ).tolist()
+            selected.extend(random_selected)
             selected = np.asarray(selected, dtype=np.int64)
+
+            audit_count = min(
+                max(0, int(os.environ.get("OPENJEV_AUDIT_PER_BATCH", "0"))),
+                max(0, random_count - 1),
+            )
+            if audit_count > 0:
+                self.last_audit_mask[active_count:active_count + audit_count] = True
 
             batch_index_1 = batch_index_1[selected]
             batch_index_2 = batch_index_2[selected]
@@ -1215,7 +1231,8 @@ class RewardModel:
 
             print(
                 f"[RRM ACTIVE QUERY] selected {active_count} high-uncertainty "
-                f"and {random_count} random comparisons from {candidate_count} candidates"
+                f"and {random_count} random comparisons from {candidate_count} candidates; "
+                f"{audit_count} random comparisons reserved for held-out audit"
             )
 
         self.query_count += mb_size
@@ -1245,6 +1262,53 @@ class RewardModel:
                 )
                 self.progress_targets.extend(scores[valid].tolist())
                 self.progress_size += int(valid.sum())
+
+    def _record_openjev_audit(self, oracle_labels, predicted_labels, confidences, audit_mask):
+        if audit_mask is None or not np.any(audit_mask):
+            return
+
+        batch_start = max(0, self.query_count - len(audit_mask))
+        for idx in np.flatnonzero(audit_mask):
+            record = {
+                "query": int(batch_start + idx),
+                "oracle_label": int(oracle_labels[idx]),
+                "predicted_label": (
+                    None if predicted_labels[idx] is None else int(predicted_labels[idx])
+                ),
+                "confidence": (
+                    None if confidences[idx] is None else float(confidences[idx])
+                ),
+            }
+            self.openjev_audit_records.append(record)
+
+        audit_path = os.path.join(self.label_save_path, "openjev_audit.jsonl")
+        with open(audit_path, "a", encoding="utf-8") as audit_file:
+            for record in self.openjev_audit_records[-int(np.sum(audit_mask)):]:
+                audit_file.write(json.dumps(record) + "\n")
+
+        thresholds = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60)
+        total = len(self.openjev_audit_records)
+        print(f"[OpenJEV AUDIT] held-out random pairs so far: {total}")
+        for threshold in thresholds:
+            accepted = [
+                record for record in self.openjev_audit_records
+                if record["predicted_label"] is not None
+                and record["confidence"] is not None
+                and record["confidence"] >= threshold
+            ]
+            accuracy = (
+                np.mean([
+                    record["predicted_label"] == record["oracle_label"]
+                    for record in accepted
+                ])
+                if accepted else float("nan")
+            )
+            coverage = len(accepted) / total if total else 0.0
+            print(
+                f"[OpenJEV AUDIT] threshold={threshold:.2f} "
+                f"accuracy={accuracy:.3f} coverage={coverage:.3f} "
+                f"({len(accepted)}/{total})"
+            )
 
     def put_queries(self, sa_t_1, sa_t_2, labels, frm_1, frm_2, vlm_weights): # frm_1 data for reward check
         total_sample = sa_t_1.shape[0]
@@ -1301,9 +1365,13 @@ class RewardModel:
             
             self.buffer_index = next_index
             
-    def get_label(self, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1=None, img_t_2=None):
+    def get_label(self, sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1=None, img_t_2=None, audit_mask=None):
         sum_r_t_1 = np.sum(r_t_1, axis=1)
         sum_r_t_2 = np.sum(r_t_2, axis=1)
+        if audit_mask is None:
+            audit_mask = np.zeros(len(sum_r_t_1), dtype=bool)
+        else:
+            audit_mask = np.asarray(audit_mask, dtype=bool).reshape(-1)
         # gt label
         # time decrease
         if self.teacher_gamma != 1:
@@ -1345,6 +1413,7 @@ class RewardModel:
             
             img_t_1 = img_t_1[valid_indices.astype(bool)]
             img_t_2 = img_t_2[valid_indices.astype(bool)]
+            audit_mask = audit_mask[valid_indices.astype(bool)]
 
             sum_r_t_1 = np.sum(r_t_1, axis=1)
             sum_r_t_2 = np.sum(r_t_2, axis=1)
@@ -1373,6 +1442,8 @@ class RewardModel:
         print(f"Using online preference model labels for this query!")
         vlm_labels = []
         vlm_weights = []
+        confidences = []
+        predicted_labels = []
         for idx, (video1, video2) in enumerate(zip(img_t_1, img_t_2)):
             print("Querying preference model: {}/{} cost time:{:.2f}".format(idx, len(labels), time.time() - start_time))
             diff = 0
@@ -1382,11 +1453,34 @@ class RewardModel:
                 print("Too similar, skip query!")
                 vlm_labels.append(-1)
                 vlm_weights.append([None, None])
+                confidences.append(None)
+                predicted_labels.append(None)
                 continue
             else:
-                label, vlm_weights_0, vlm_weights_1 = self.client.video_preference_label(video1, video2, time_string, idx)
+                label, vlm_weights_0, vlm_weights_1, confidence, predicted_label = self.client.video_preference_label(video1, video2, time_string, idx)
                 vlm_labels.append(label)
                 vlm_weights.append([vlm_weights_0, vlm_weights_1])
+                confidences.append(confidence)
+                predicted_labels.append(predicted_label)
+
+        self._record_openjev_audit(
+            rational_labels,
+            predicted_labels,
+            confidences,
+            audit_mask,
+        )
+
+        # Audit comparisons are never used to train either RRM or PRM.
+        training_mask = ~audit_mask
+        sa_t_1 = sa_t_1[training_mask]
+        sa_t_2 = sa_t_2[training_mask]
+        r_t_1 = r_t_1[training_mask]
+        r_t_2 = r_t_2[training_mask]
+        rational_labels = rational_labels[training_mask]
+        vlm_labels = [label for label, keep in zip(vlm_labels, training_mask) if keep]
+        vlm_weights = [row for row, keep in zip(vlm_weights, training_mask) if keep]
+        img_t_1 = img_t_1[training_mask]
+        img_t_2 = img_t_2[training_mask]
         
         # Preserve frame-level scores for PRM before filtering abstained pairs.
         self._store_progress_scores(img_t_1, img_t_2, vlm_weights)
@@ -1439,7 +1533,15 @@ class RewardModel:
             # use online vlm labels
             sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2 =  self.get_queries(mb_size=self.mb_size)
 
-            sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2, gt_labels, vlm_labels, vlm_weights = self.get_label(sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2)
+            sa_t_1, sa_t_2, r_t_1, r_t_2, img_t_1, img_t_2, gt_labels, vlm_labels, vlm_weights = self.get_label(
+                sa_t_1,
+                sa_t_2,
+                r_t_1,
+                r_t_2,
+                img_t_1,
+                img_t_2,
+                audit_mask=self.last_audit_mask,
+            )
         
         else:
             # use cached vlm labels
