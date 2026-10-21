@@ -31,7 +31,8 @@ openjev_base_url = os.environ.get(
 openjev_model = os.environ.get("OPENJEV_MODEL", "openjev")
 openjev_token = os.environ.get("OPENJEV_TOKEN")
 openjev_timeout = float(os.environ.get("OPENJEV_TIMEOUT", "120"))
-openjev_skip_margin = float(os.environ.get("OPENJEV_SKIP_MARGIN", "0.05"))
+# Abstain on near-tie OpenJEV comparisons instead of training on weak guesses.
+openjev_skip_margin = float(os.environ.get("OPENJEV_SKIP_MARGIN", "0.15"))
 
 def get_n_indices(length, k):
     return [int(round(i)) for i in np.linspace(0, length - 1, k)]
@@ -288,8 +289,12 @@ class PreAgent(Agent):
             "preference": {
                 "type": "choice",
                 "instructions": (
-                    "Which clip's final sampled frame shows more completion "
-                    "of the task? Compare A3 with B3 using the references."
+                    "Which clip shows more overall task progress across the "
+                    "whole sampled interval? Compare A1, A2, and A3 with "
+                    "B1, B2, and B3 against the initial and goal references. "
+                    "Consider all three frames and the progress made through "
+                    "the interval; do not decide from only the final frame. "
+                    "Ignore motion or visual changes unrelated to the task."
                 ),
                 "criteria": {
                     "A": "Clip A, whose sampled frames are labeled A1-A3",
@@ -340,12 +345,17 @@ class PreAgent(Agent):
         if choice not in {"A", "B"}:
             raise ValueError(f"OpenJEV returned an invalid clip choice: {choice!r}")
 
-        probabilities = answers["preference"].get("probabilities", {})
+        preference_answer = answers["preference"]
+        probabilities = preference_answer.get("probabilities", {})
         probability_gap = abs(
             float(probabilities.get("A", 0.0))
             - float(probabilities.get("B", 0.0))
         )
-        label = -1 if probability_gap < openjev_skip_margin else int(choice == "B")
+        # OpenJEV returns a normalized confidence for choice answers. Keep the
+        # probability-gap fallback for helper versions that omit that field.
+        confidence = float(preference_answer.get("confidence", probability_gap))
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        label = -1 if confidence < openjev_skip_margin else int(choice == "B")
 
         def get_scores(clip):
             values = []
@@ -354,7 +364,7 @@ class PreAgent(Agent):
                 values.append(float(np.clip(score, 0.0, 1.0)))
             return np.asarray(values, dtype=np.float32)
 
-        return label, get_scores("A"), get_scores("B"), response
+        return label, get_scores("A"), get_scores("B"), confidence, response
 
     def extract_answer(self, response):
 
@@ -397,7 +407,7 @@ class PreAgent(Agent):
         if label_backend == "openjev":
             for attempt in range(max_retries):
                 try:
-                    label, weight_a, weight_b, response = self._openjev_label_and_progress(
+                    label, weight_a, weight_b, confidence, response = self._openjev_label_and_progress(
                         query_img_t_1,
                         query_img_t_2,
                     )
@@ -411,8 +421,18 @@ class PreAgent(Agent):
                     if label != -1:
                         weight_a = self.interpolate_to_weight_dist(weight_a, sample_indices)
                         weight_b = self.interpolate_to_weight_dist(weight_b, sample_indices)
+                        print(
+                            f"OpenJEV preference label: {label} "
+                            f"(confidence {confidence:.3f}; "
+                            f"skip threshold {openjev_skip_margin:.3f})"
+                        )
                     else:
                         weight_a = weight_b = None
+                        print(
+                            f"OpenJEV skipped an uncertain preference "
+                            f"(confidence {confidence:.3f}; "
+                            f"skip threshold {openjev_skip_margin:.3f})"
+                        )
                     return label, weight_a, weight_b
                 except Exception as e:
                     print(

@@ -1220,7 +1220,7 @@ class RewardModel:
         vlm_labels = []
         vlm_weights = []
         for idx, (video1, video2) in enumerate(zip(img_t_1, img_t_2)):
-            print("Querying qwen: {}/{} cost time:{:.2f}".format(idx, len(labels), time.time() - start_time))
+            print("Querying preference model: {}/{} cost time:{:.2f}".format(idx, len(labels), time.time() - start_time))
             diff = 0
             for idx_diff in range(len(video1)):
                 diff += np.linalg.norm(video1[idx_diff] - video2[idx_diff])
